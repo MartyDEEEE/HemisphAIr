@@ -13,7 +13,10 @@ class Terminal:
         self.name = name
         self.buffer = ""
         self.lock = threading.Lock()
-    
+        self.subprocess = None
+        self.is_external = False
+        self.command_history = []
+        
     def write(self, text):
         with self.lock:
             self.buffer += text
@@ -27,15 +30,359 @@ class Terminal:
     def get_buffer(self):
         with self.lock:
             return self.buffer
+    
+    def launch_external_terminal(self):
+        """Launch an external terminal that llm1 can directly interact with"""
+        # Create a dedicated directory for this terminal session
+        terminal_dir = f"{self.name.replace(' ', '_').lower()}_terminal"
+        if not os.path.exists(terminal_dir):
+            os.makedirs(terminal_dir)
+            
+        # Create a Python script that will run in the terminal
+        terminal_script = os.path.join(terminal_dir, "terminal_interface.py")
+        
+        with open(terminal_script, "w") as f:
+            f.write("""
+import os
+import sys
+import time
+import socket
+import threading
+import subprocess
+import json
+import traceback
+
+# Set up a server socket to communicate with the main process
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind(('localhost', 0))  # Use any available port
+server_port = server_socket.getsockname()[1]
+server_socket.listen(1)
+
+print(f"TERMINAL_PORT={server_port}")
+sys.stdout.flush()
+
+def handle_client(conn):
+    while True:
+        try:
+            # Receive command from the main process
+            data = conn.recv(4096).decode('utf-8')
+            
+            if not data:
+                break
+                
+            if data.startswith("EXIT_TERMINAL"):
+                print("\\nExiting terminal...")
+                conn.close()
+                sys.exit(0)
+                
+            # Parse the command
+            try:
+                command_data = json.loads(data)
+                command_type = command_data.get('type', '')
+                command = command_data.get('command', '')
+                
+                if command_type == 'shell':
+                    # Execute shell command
+                    print(f"\\n$ {command}")
+                    sys.stdout.flush()
+                    
+                    process = subprocess.Popen(
+                        command,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1
+                    )
+                    
+                    # Capture output in real-time
+                    stdout_data = ""
+                    stderr_data = ""
+                    
+                    for line in process.stdout:
+                        stdout_data += line
+                        print(line, end='')
+                        sys.stdout.flush()
+                        
+                    process.stdout.close()
+                    
+                    for line in process.stderr:
+                        stderr_data += line
+                        print(f"Error: {line}", end='')
+                        sys.stdout.flush()
+                        
+                    process.stderr.close()
+                    
+                    return_code = process.wait()
+                    
+                    response = {
+                        'stdout': stdout_data,
+                        'stderr': stderr_data,
+                        'return_code': return_code
+                    }
+                    
+                    # Send the response back to the main process
+                    conn.sendall(json.dumps(response).encode('utf-8'))
+                    
+                elif command_type == 'python':
+                    # Execute Python code
+                    try:
+                        # Save the code to a file
+                        with open("temp_code.py", "w") as f:
+                            f.write(command)
+                            
+                        print(f"\\n>>> Executing Python code:")
+                        
+                        # Print the code
+                        for i, line in enumerate(command.split('\\n')):
+                            print(f"{i+1}: {line}")
+                            
+                        print("\\nOutput:")
+                        sys.stdout.flush()
+                        
+                        # Execute the code
+                        process = subprocess.Popen(
+                            [sys.executable, "temp_code.py"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=1
+                        )
+                        
+                        # Capture output in real-time
+                        stdout_data = ""
+                        stderr_data = ""
+                        
+                        for line in process.stdout:
+                            stdout_data += line
+                            print(line, end='')
+                            sys.stdout.flush()
+                            
+                        process.stdout.close()
+                        
+                        for line in process.stderr:
+                            stderr_data += line
+                            print(f"Error: {line}", end='')
+                            sys.stdout.flush()
+                            
+                        process.stderr.close()
+                        
+                        return_code = process.wait()
+                        
+                        print(f"\\n>>> Process exited with code {return_code}")
+                        sys.stdout.flush()
+                        
+                        response = {
+                            'stdout': stdout_data,
+                            'stderr': stderr_data,
+                            'return_code': return_code
+                        }
+                        
+                        # Send the response back to the main process
+                        conn.sendall(json.dumps(response).encode('utf-8'))
+                        
+                    except Exception as e:
+                        error_traceback = traceback.format_exc()
+                        print(f"Error executing Python code: {str(e)}\\n{error_traceback}")
+                        sys.stdout.flush()
+                        
+                        response = {
+                            'stdout': '',
+                            'stderr': f"Error: {str(e)}\\n{error_traceback}",
+                            'return_code': -1
+                        }
+                        
+                        # Send the response back to the main process
+                        conn.sendall(json.dumps(response).encode('utf-8'))
+                        
+            except json.JSONDecodeError:
+                print(f"Error parsing command: {data}")
+                sys.stdout.flush()
+                
+                response = {
+                    'stdout': '',
+                    'stderr': f"Error parsing command: {data}",
+                    'return_code': -1
+                }
+                
+                # Send the response back to the main process
+                conn.sendall(json.dumps(response).encode('utf-8'))
+                
+        except Exception as e:
+            error_traceback = traceback.format_exc()
+            print(f"Error in terminal interface: {str(e)}\\n{error_traceback}")
+            sys.stdout.flush()
+            break
+    
+    conn.close()
+
+# Accept a connection from the main process
+print("Waiting for connection from main process...")
+sys.stdout.flush()
+
+client_socket, _ = server_socket.accept()
+print("Connected to main process")
+sys.stdout.flush()
+
+handle_client(client_socket)
+
+print("Terminal interface shutting down")
+server_socket.close()
+sys.exit(0)
+""")
+        
+        # Determine the appropriate terminal command based on OS
+        terminal_command = ""
+        if sys.platform.startswith('win'):
+            # Windows: use 'start' to open a new Command Prompt window
+            terminal_command = f'start cmd /K python "{terminal_script}"'
+        elif sys.platform.startswith('darwin'):
+            # macOS: use 'open' with Terminal.app
+            terminal_command = f'osascript -e \'tell app "Terminal" to do script "cd {os.getcwd()} && python3 {terminal_script}"\''
+        else:
+            # Linux/Unix: try common terminal emulators
+            terminals = ['gnome-terminal', 'xterm', 'konsole', 'terminology', 'terminator']
+            for term in terminals:
+                if subprocess.call(['which', term], stdout=subprocess.PIPE, stderr=subprocess.PIPE) == 0:
+                    if term == 'gnome-terminal':
+                        terminal_command = f'{term} -- python3 "{terminal_script}"'
+                    else:
+                        terminal_command = f'{term} -e "python3 \'{terminal_script}\'"'
+                    break
+        
+        if not terminal_command:
+            print(f"Could not find a suitable terminal emulator for your system. Using fallback method.")
+            return False
+            
+        try:
+            # Launch the terminal with our script
+            print(f"Launching external terminal for {self.name}...")
+            process = subprocess.Popen(
+                terminal_command, 
+                shell=True, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+            
+            # Wait for the terminal to start and extract the port number
+            port_line = ""
+            for line in process.stdout:
+                if line.startswith("TERMINAL_PORT="):
+                    port_line = line.strip()
+                    break
+            
+            if not port_line:
+                print(f"Error: Terminal did not report its port. Falling back to internal terminal.")
+                return False
+                
+            # Extract the port number
+            port = int(port_line.split("=")[1])
+            
+            # Connect to the terminal
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect(('localhost', port))
+            
+            self.is_external = True
+            self.subprocess = process
+            
+            print(f"Successfully connected to external terminal for {self.name}.")
+            return True
+            
+        except Exception as e:
+            print(f"Error launching external terminal: {str(e)}")
+            print(f"Falling back to internal terminal.")
+            return False
+    
+    def send_command(self, command_type, command):
+        """Send a command to the external terminal"""
+        if not self.is_external:
+            return {
+                'stdout': '',
+                'stderr': 'External terminal not available',
+                'return_code': -1
+            }
+            
+        try:
+            # Format the command as JSON
+            command_data = {
+                'type': command_type,
+                'command': command
+            }
+            
+            # Add to command history
+            self.command_history.append(command_data)
+            
+            # Send the command to the terminal
+            self.socket.sendall(json.dumps(command_data).encode('utf-8'))
+            
+            # Receive the response
+            response_data = ""
+            while True:
+                data = self.socket.recv(4096).decode('utf-8')
+                if not data:
+                    break
+                    
+                response_data += data
+                
+                try:
+                    # Try to parse as JSON to see if it's complete
+                    response = json.loads(response_data)
+                    return response
+                except json.JSONDecodeError:
+                    # Not complete yet, keep receiving
+                    continue
+                    
+            # If we got here, something went wrong
+            return {
+                'stdout': '',
+                'stderr': 'Incomplete response from terminal',
+                'return_code': -1
+            }
+            
+        except Exception as e:
+            return {
+                'stdout': '',
+                'stderr': f'Error sending command to terminal: {str(e)}',
+                'return_code': -1
+            }
+    
+    def close_external_terminal(self):
+        """Close the external terminal"""
+        if not self.is_external:
+            return
+            
+        try:
+            # Send exit command to the terminal
+            self.socket.sendall("EXIT_TERMINAL".encode('utf-8'))
+            self.socket.close()
+            
+            # Wait for the subprocess to exit
+            if self.subprocess:
+                self.subprocess.wait(timeout=2)
+                
+        except Exception as e:
+            print(f"Error closing external terminal: {str(e)}")
+            
+        self.is_external = False
+        self.subprocess = None
 
 class LLM:
     """Class to represent an LLM with methods for getting responses and executing code"""
-    def __init__(self, model_name, role, terminal, can_execute_code=False):
+    def __init__(self, model_name, role, terminal, can_execute_code=False, use_external_terminal=False):
         self.model_name = model_name
         self.role = role
         self.terminal = terminal
         self.can_execute_code = can_execute_code
+        self.use_external_terminal = use_external_terminal
         self.conversation_history = []
+        
+        # If this LLM should use an external terminal, try to launch it
+        if self.use_external_terminal and self.can_execute_code:
+            self.has_external_terminal = self.terminal.launch_external_terminal()
+        else:
+            self.has_external_terminal = False
         
     def get_response_stream(self, prompt, callback=None):
         """Get a response from the LLM and stream it in real-time"""
@@ -119,6 +466,35 @@ class LLM:
                 "status": "error"
             }
         
+        # If using an external terminal, send the code there
+        if self.has_external_terminal:
+            if callback:
+                callback("Sending code to external terminal...\n")
+            
+            # Send the command to the external terminal
+            result = self.terminal.send_command('python', code)
+            
+            # Process the result
+            if callback:
+                if 'stdout' in result and result['stdout']:
+                    callback(result['stdout'])
+                
+                if 'stderr' in result and result['stderr']:
+                    callback(f"Error: {result['stderr']}")
+                
+                return_code = result.get('return_code', -1)
+                if return_code != 0:
+                    callback(f"\nCode execution failed with return code {return_code}")
+                    status = "failed"
+                else:
+                    callback("\nCode execution completed successfully")
+                    status = "success"
+            
+            # Return the result
+            result["status"] = status
+            return result
+        
+        # Otherwise, use the internal execution method
         # Create a directory for the LLM if it doesn't exist
         llm_dir = f"{self.role.replace(' ', '_').lower()}_workspace"
         if not os.path.exists(llm_dir):
@@ -251,19 +627,28 @@ class LLM:
 
 class BrainSimulation:
     """Main class that orchestrates the conversation between the LLMs"""
-    def __init__(self, llm1_model="llama2", llm2_model="mistral"):
+    def __init__(self, llm1_model="llama2", llm2_model="mistral", use_external_terminal=True):
         # Initialize terminals
         self.llm1_terminal = Terminal("Left Hemisphere")
         self.llm2_terminal = Terminal("Right Hemisphere")
         
         # Initialize LLMs
-        self.llm1 = LLM(llm1_model, "Left Hemisphere", self.llm1_terminal, can_execute_code=True)
-        self.llm2 = LLM(llm2_model, "Right Hemisphere", self.llm2_terminal, can_execute_code=False)
+        self.llm1 = LLM(llm1_model, "Left Hemisphere", self.llm1_terminal, 
+                        can_execute_code=True, use_external_terminal=use_external_terminal)
+        self.llm2 = LLM(llm2_model, "Right Hemisphere", self.llm2_terminal, 
+                        can_execute_code=False)
     
     def run(self):
         """Run the brain simulation"""
         print("Welcome to the Hemispherical Brain Simulation!")
         print("Type 'exit' to quit the simulation.")
+        
+        # Check if we have an external terminal for llm1
+        if self.llm1.has_external_terminal:
+            print("Left Hemisphere (llm1) has its own terminal window.")
+            print("It can execute Python code and shell commands in that window.")
+        else:
+            print("Left Hemisphere (llm1) will execute code within this process.")
         
         # Check if Ollama is running
         try:
@@ -387,6 +772,8 @@ class BrainSimulation:
         Think about this query from your left-hemisphere perspective and discuss it with the right hemisphere (llm2).
         You have the ability to execute Python code to help solve problems or demonstrate concepts.
         
+        {'You have your own dedicated terminal window where your code will run. You can see the output in real-time in that window.' if self.llm1.has_external_terminal else 'Your code will run in this process and the output will be shown here.'}
+        
         To execute code, format it as:
         ```python
         # Your code here
@@ -495,6 +882,7 @@ def main():
     parser.add_argument('--llm2', default='mistral', help='Model name for the right hemisphere (default: mistral)')
     parser.add_argument('--force', action='store_true', help='Force run without checking model availability')
     parser.add_argument('--list-models', action='store_true', help='List available models and exit')
+    parser.add_argument('--no-terminal', action='store_true', help='Disable external terminal for the left hemisphere')
     
     args = parser.parse_args()
     
@@ -530,7 +918,11 @@ def main():
             return
     
     # Create and run the simulation
-    simulation = BrainSimulation(llm1_model=args.llm1, llm2_model=args.llm2)
+    simulation = BrainSimulation(
+        llm1_model=args.llm1, 
+        llm2_model=args.llm2,
+        use_external_terminal=not args.no_terminal
+    )
     
     # Modify the run method to bypass model checking if --force is used
     if args.force:
