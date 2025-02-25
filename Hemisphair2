@@ -1,0 +1,372 @@
+import subprocess
+import os
+import time
+import sys
+import requests
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+
+class OllamaClient:
+    """Client for communicating with Ollama API"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434"):
+        self.base_url = base_url
+        self.api_generate = f"{base_url}/api/generate"
+        self.api_chat = f"{base_url}/api/chat"
+    
+    def generate(self, model: str, prompt: str, system: Optional[str] = None) -> str:
+        """Generate a response from the model with streaming output"""
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True
+        }
+        
+        if system:
+            data["system"] = system
+            
+        response = requests.post(self.api_generate, json=data, stream=True)
+        
+        if response.status_code != 200:
+            raise Exception(f"Error: {response.status_code} - {response.text}")
+        
+        # Stream the response
+        full_response = ""
+        for line in response.iter_lines():
+            if line:
+                resp_json = json.loads(line)
+                if 'response' in resp_json:
+                    chunk = resp_json['response']
+                    full_response += chunk
+                    # Print the chunk without a newline to create streaming effect
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+        
+        # Add a newline at the end
+        print()
+        return full_response
+
+    def chat(self, model: str, messages: List[Dict[str, str]], 
+             system: Optional[str] = None, stream: bool = True) -> str:
+        """Chat with the model using message history with streaming output"""
+        data = {
+            "model": model,
+            "messages": messages,
+            "stream": stream
+        }
+        
+        if system:
+            data["system"] = system
+            
+        if stream:
+            response = requests.post(self.api_chat, json=data, stream=True)
+            
+            if response.status_code != 200:
+                raise Exception(f"Error: {response.status_code} - {response.text}")
+            
+            # Stream the response
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        resp_json = json.loads(line)
+                        if 'message' in resp_json and 'content' in resp_json['message']:
+                            chunk = resp_json['message']['content']
+                            full_response += chunk
+                            # Print the chunk without a newline
+                            sys.stdout.write(chunk)
+                            sys.stdout.flush()
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Add a newline at the end
+            print()
+            return full_response
+        else:
+            response = requests.post(self.api_chat, json=data)
+            
+            if response.status_code != 200:
+                raise Exception(f"Error: {response.status_code} - {response.text}")
+            
+            response_json = response.json()
+            return response_json["message"]["content"]
+
+
+class BrainHemisphere:
+    """Represents one hemisphere of the brain (an LLM)"""
+    
+    def __init__(self, name: str, model: str, client: OllamaClient, 
+                 system_prompt: Optional[str] = None):
+        self.name = name
+        self.model = model
+        self.client = client
+        self.system_prompt = system_prompt
+        self.messages: List[Dict[str, str]] = []
+        if system_prompt:
+            self.messages.append({"role": "system", "content": system_prompt})
+    
+    def send_message(self, content: str, role: str = "user") -> str:
+        """Send a message to this hemisphere and get its response"""
+        self.messages.append({"role": role, "content": content})
+        
+        # Get response from the model
+        response = self.client.chat(self.model, self.messages, self.system_prompt)
+        
+        # Add the response to the message history
+        self.messages.append({"role": "assistant", "content": response})
+        
+        return response
+
+
+class TerminalExecutor:
+    """Handles execution of terminal commands and Python scripts"""
+    
+    def __init__(self, working_dir: str):
+        self.working_dir = working_dir
+        os.makedirs(working_dir, exist_ok=True)
+    
+    def execute_command(self, command: str) -> str:
+        """Execute a terminal command and return the output"""
+        try:
+            result = subprocess.run(
+                command, 
+                shell=True, 
+                cwd=self.working_dir,
+                capture_output=True,
+                text=True
+            )
+            return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        except Exception as e:
+            return f"Error executing command: {str(e)}"
+    
+    def write_python_script(self, filename: str, content: str) -> str:
+        """Write a Python script to disk"""
+        try:
+            filepath = os.path.join(self.working_dir, filename)
+            with open(filepath, "w") as f:
+                f.write(content)
+            return f"Successfully wrote script to {filepath}"
+        except Exception as e:
+            return f"Error writing script: {str(e)}"
+    
+    def run_python_script(self, filename: str) -> str:
+        """Run a Python script and return the output"""
+        try:
+            filepath = os.path.join(self.working_dir, filename)
+            result = subprocess.run(
+                f"python {filepath}", 
+                shell=True, 
+                cwd=self.working_dir,
+                capture_output=True,
+                text=True
+            )
+            return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        except Exception as e:
+            return f"Error running script: {str(e)}"
+
+
+class BrainSimulator:
+    """Simulates the hemispherical model of the brain using two LLMs"""
+    
+    def __init__(self, llm1_model: str, llm2_model: str, 
+                 working_dir: str = "./brain_workspace"):
+        # Initialize the Ollama client
+        self.client = OllamaClient()
+        
+        # Initialize the terminal executor
+        self.executor = TerminalExecutor(working_dir)
+        
+        # Create hemispheres
+        self.llm1 = BrainHemisphere(
+            name="Left Hemisphere",
+            model=llm1_model,
+            client=self.client,
+            system_prompt=(
+                "You are the left hemisphere of a brain, focused on logical, analytical, "
+                "and sequential thinking. You can write and execute Python code, analyze data, "
+                "and solve complex problems. You have access to terminal commands and can "
+                "create Python scripts. To use these abilities, start your message with one "
+                "of these commands:\n"
+                "1. !TERMINAL: <command> - Execute a terminal command\n"
+                "2. !WRITE_SCRIPT: <filename> - Write a Python script (the content will follow)\n"
+                "3. !RUN_SCRIPT: <filename> - Run a Python script\n"
+                "After any command, continue your message to the right hemisphere."
+            )
+        )
+        
+        self.llm2 = BrainHemisphere(
+            name="Right Hemisphere",
+            model=llm2_model,
+            client=self.client,
+            system_prompt=(
+                "You are the right hemisphere of a brain, focused on creativity, intuition, "
+                "and holistic thinking. You excel at generating ideas, recognizing patterns, "
+                "and providing context and emotional perspectives. Collaborate with the left "
+                "hemisphere to provide balanced and comprehensive insights."
+            )
+        )
+    
+    def parse_script_content(self, text: str) -> Tuple[str, bool]:
+        """Extract Python script content from a message"""
+        script_content = ""
+        found_script = False
+        
+        # Look for code blocks with ```python ... ``` format
+        lines = text.split('\n')
+        in_script = False
+        
+        for line in lines:
+            if line.strip() in ["```python", "```py"]:
+                in_script = True
+                found_script = True
+                continue
+            elif line.strip() == "```" and in_script:
+                in_script = False
+                continue
+            elif in_script:
+                script_content += line + "\n"
+        
+        return script_content, found_script
+    
+    def process_llm1_response(self, response: str) -> Dict[str, Any]:
+        """Process the response from LLM1 and execute any commands"""
+        result = {"processed_response": response, "executed_command": False}
+        lines = response.split('\n')
+        
+        if not lines:
+            return result
+        
+        first_line = lines[0].strip()
+        
+        if first_line.startswith("!TERMINAL:"):
+            command = first_line[len("!TERMINAL:"):].strip()
+            print(f"\n[Left Hemisphere - Executing Terminal Command] {command}")
+            output = self.executor.execute_command(command)
+            result["command_output"] = output
+            result["executed_command"] = True
+            # Remove the command line from the message to LLM2
+            result["processed_response"] = '\n'.join(lines[1:])
+        
+        elif first_line.startswith("!WRITE_SCRIPT:"):
+            filename = first_line[len("!WRITE_SCRIPT:"):].strip()
+            # Extract the script content
+            script_content, found_script = self.parse_script_content('\n'.join(lines[1:]))
+            
+            if found_script and script_content:
+                print(f"\n[Left Hemisphere - Writing Python Script] {filename}")
+                output = self.executor.write_python_script(filename, script_content)
+                result["command_output"] = output
+                result["executed_command"] = True
+                
+                # Remove the script from the message to LLM2
+                new_response = first_line + "\n"
+                in_code_block = False
+                for line in lines[1:]:
+                    if line.strip() in ["```python", "```py"]:
+                        in_code_block = True
+                    elif line.strip() == "```" and in_code_block:
+                        in_code_block = False
+                    elif not in_code_block:
+                        new_response += line + "\n"
+                
+                result["processed_response"] = new_response.replace(first_line + "\n", "", 1)
+        
+        elif first_line.startswith("!RUN_SCRIPT:"):
+            filename = first_line[len("!RUN_SCRIPT:"):].strip()
+            print(f"\n[Left Hemisphere - Running Python Script] {filename}")
+            output = self.executor.run_python_script(filename)
+            result["command_output"] = output
+            result["executed_command"] = True
+            # Remove the command line from the message to LLM2
+            result["processed_response"] = '\n'.join(lines[1:])
+        
+        return result
+    
+    def simulate_conversation(self, user_query: str, max_turns: int = 5):
+        """Simulate a conversation between the two hemispheres"""
+        print(f"\n[User] {user_query}")
+        
+        print(f"\n[Left Hemisphere thinking...]")
+        # Send the user query to LLM1
+        llm1_response = self.llm1.send_message(user_query)
+        
+        for turn in range(max_turns):
+            # Process LLM1's response (execute any commands)
+            processed = self.process_llm1_response(llm1_response)
+            
+            # Display command output if any
+            if processed["executed_command"] and "command_output" in processed:
+                print(f"\n[Left Hemisphere - Command Output]\n{processed['command_output']}")
+            
+            # Display LLM1's message to LLM2
+            print(f"\n[Left Hemisphere → Right Hemisphere]")
+            print(processed["processed_response"])
+            
+            print(f"\n[Right Hemisphere thinking...]")
+            # Send LLM1's processed response to LLM2
+            llm2_response = self.llm2.send_message(processed["processed_response"])
+            
+            # Display LLM2's response
+            print(f"\n[Right Hemisphere → Left Hemisphere]")
+            print(llm2_response)
+            
+            print(f"\n[Left Hemisphere thinking...]")
+            # Send LLM2's response back to LLM1
+            llm1_response = self.llm1.send_message(llm2_response)
+            
+            # Check if the conversation seems to be concluding
+            lower_response = llm1_response.lower()
+            if (("conclusion" in lower_response and "final" in lower_response) or 
+                ("i believe we've addressed" in lower_response) or
+                turn == max_turns - 1):
+                break
+    
+    def run_interactive(self):
+        """Run the brain simulator interactively"""
+        print("\n" + "="*60)
+        print("   BRAIN HEMISPHERE SIMULATOR USING DUAL LLMs".center(60))
+        print("="*60)
+        print("\nThis program simulates the hemispherical model of the brain using two LLMs")
+        print("- Left hemisphere: Logical, analytical, with terminal & Python capabilities")
+        print("- Right hemisphere: Creative, intuitive, holistic thinking")
+        print("\nType your query to start a conversation between the two hemispheres.")
+        print("Type 'exit' to quit.")
+        
+        while True:
+            user_input = input("\n\nYour query: ")
+            if user_input.lower() in ["exit", "quit", "q"]:
+                break
+            
+            self.simulate_conversation(user_input)
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Brain Hemisphere Simulator using LLMs")
+    parser.add_argument("--llm1", default="llama2", help="Model name for LLM1 (left hemisphere)")
+    parser.add_argument("--llm2", default="llama2", help="Model name for LLM2 (right hemisphere)")
+    parser.add_argument("--working-dir", default="./brain_workspace", 
+                      help="Working directory for scripts and execution")
+    parser.add_argument("--max-turns", type=int, default=5, 
+                      help="Maximum number of conversation turns")
+    
+    args = parser.parse_args()
+    
+    # Ensure working directory exists
+    os.makedirs(args.working_dir, exist_ok=True)
+    
+    try:
+        brain = BrainSimulator(args.llm1, args.llm2, args.working_dir)
+        brain.run_interactive()
+    except KeyboardInterrupt:
+        print("\nExiting Brain Simulator. Goodbye!")
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        print("\nMake sure Ollama is running and accessible at http://localhost:11434")
+        print("Install it from https://ollama.ai if needed.")
+
+
+if __name__ == "__main__":
+    main()
