@@ -1,0 +1,447 @@
+import os
+import subprocess
+import requests
+import json
+import time
+import threading
+import sys
+import re
+
+class Terminal:
+    """Class to handle terminal output with thread safety"""
+    def __init__(self, name):
+        self.name = name
+        self.buffer = ""
+        self.lock = threading.Lock()
+    
+    def write(self, text):
+        with self.lock:
+            self.buffer += text
+            sys.stdout.write(text)
+            sys.stdout.flush()
+    
+    def clear(self):
+        with self.lock:
+            self.buffer = ""
+            
+    def get_buffer(self):
+        with self.lock:
+            return self.buffer
+
+class LLM:
+    """Class to represent an LLM with methods for getting responses and executing code"""
+    def __init__(self, model_name, role, terminal, can_execute_code=False):
+        self.model_name = model_name
+        self.role = role
+        self.terminal = terminal
+        self.can_execute_code = can_execute_code
+        self.conversation_history = []
+        
+    def get_response_stream(self, prompt, callback=None):
+        """Get a response from the LLM and stream it in real-time"""
+        url = "http://localhost:11434/api/generate"
+        data = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": True
+        }
+        
+        try:
+            response = requests.post(url, json=data, stream=True)
+            
+            if response.status_code == 200:
+                full_response = ""
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_json = json.loads(line.decode('utf-8'))
+                            response_piece = line_json.get("response", "")
+                            full_response += response_piece
+                            
+                            if callback:
+                                callback(response_piece)
+                            
+                            # Check if this is the end of the response
+                            if line_json.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            # Handle potential JSON decoding errors
+                            if callback:
+                                callback(f"Error decoding response: {line.decode('utf-8')}")
+                
+                # Add to conversation history
+                self.conversation_history.append({"role": "user", "content": prompt})
+                self.conversation_history.append({"role": "assistant", "content": full_response})
+                
+                return full_response
+            else:
+                error_message = f"Error: {response.status_code} - {response.text}"
+                
+                if callback:
+                    callback(error_message)
+                    
+                return error_message
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error connecting to Ollama: {str(e)}"
+            
+            if callback:
+                callback(error_message)
+                
+            return error_message
+    
+    def extract_code_blocks(self, text):
+        """Extract Python code blocks from text"""
+        code_blocks = []
+        pattern = r"```python(.*?)```"
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        for match in matches:
+            code_blocks.append(match.strip())
+            
+        return code_blocks
+    
+    def execute_code(self, code, callback=None):
+        """Execute Python code and capture the output"""
+        if not self.can_execute_code:
+            message = "This LLM is not allowed to execute code."
+            if callback:
+                callback(message)
+            return {
+                "stdout": "",
+                "stderr": message,
+                "return_code": -1,
+                "status": "error"
+            }
+        
+        # Create a directory for the LLM if it doesn't exist
+        llm_dir = f"{self.role.replace(' ', '_').lower()}_workspace"
+        if not os.path.exists(llm_dir):
+            os.makedirs(llm_dir)
+        
+        # Change to the LLM's directory
+        current_dir = os.getcwd()
+        os.chdir(llm_dir)
+        
+        # Save the code to a temporary file
+        try:
+            with open("temp_code.py", "w") as f:
+                f.write(code)
+        except Exception as e:
+            if callback:
+                callback(f"Error writing code to file: {str(e)}")
+            os.chdir(current_dir)  # Make sure to change back to the original directory
+            return {
+                "stdout": "",
+                "stderr": f"Error writing code to file: {str(e)}",
+                "return_code": -1,
+                "status": "error"
+            }
+        
+        # Execute the code and capture the output
+        try:
+            if callback:
+                callback("Executing code...\n")
+            
+            # Create a process to run the code with a timeout
+            process = subprocess.Popen(["python", "temp_code.py"], 
+                                      stdout=subprocess.PIPE, 
+                                      stderr=subprocess.PIPE, 
+                                      text=True)
+            
+            stdout_lines = []
+            stderr_lines = []
+            
+            # Set a timeout for the code execution
+            max_execution_time = 30  # seconds
+            start_time = time.time()
+            
+            # Read stdout and stderr in real-time
+            while True:
+                # Check if we've exceeded the timeout
+                if time.time() - start_time > max_execution_time:
+                    process.kill()
+                    if callback:
+                        callback("\nCode execution timed out after 30 seconds.")
+                    return {
+                        "stdout": "".join(stdout_lines),
+                        "stderr": "Execution timed out after 30 seconds.",
+                        "return_code": -1,
+                        "status": "timeout"
+                    }
+                
+                # Try to read a line from stdout and stderr
+                try:
+                    stdout_line = process.stdout.readline()
+                    stderr_line = process.stderr.readline()
+                    
+                    if stdout_line:
+                        stdout_lines.append(stdout_line)
+                        if callback:
+                            callback(stdout_line)
+                    
+                    if stderr_line:
+                        stderr_lines.append(stderr_line)
+                        if callback:
+                            callback(f"Error: {stderr_line}")
+                    
+                    # Check if the process has finished
+                    if process.poll() is not None:
+                        # Read any remaining output
+                        for line in process.stdout:
+                            stdout_lines.append(line)
+                            if callback:
+                                callback(line)
+                        
+                        for line in process.stderr:
+                            stderr_lines.append(line)
+                            if callback:
+                                callback(f"Error: {line}")
+                        
+                        break
+                    
+                    # Sleep briefly to avoid high CPU usage
+                    time.sleep(0.01)
+                
+                except Exception as e:
+                    if callback:
+                        callback(f"\nError reading process output: {str(e)}")
+                    stderr_lines.append(f"Error reading process output: {str(e)}")
+                    break
+            
+            return_code = process.returncode
+            
+            stdout_text = "".join(stdout_lines)
+            stderr_text = "".join(stderr_lines)
+            
+            result = {
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "return_code": return_code
+            }
+            
+            if return_code != 0:
+                if callback:
+                    callback(f"\nCode execution failed with return code {return_code}")
+                result["status"] = "failed"
+            else:
+                if callback:
+                    callback("\nCode execution completed successfully")
+                result["status"] = "success"
+            
+            return result
+            
+        except Exception as e:
+            if callback:
+                callback(f"\nError executing code: {str(e)}")
+            return {
+                "stdout": "",
+                "stderr": str(e),
+                "return_code": -1,
+                "status": "error"
+            }
+        finally:
+            # Clean up and return to the original directory
+            os.chdir(current_dir)
+
+class BrainSimulation:
+    """Main class that orchestrates the conversation between the LLMs"""
+    def __init__(self, llm1_model="llama2", llm2_model="mistral"):
+        # Initialize terminals
+        self.llm1_terminal = Terminal("Left Hemisphere")
+        self.llm2_terminal = Terminal("Right Hemisphere")
+        
+        # Initialize LLMs
+        self.llm1 = LLM(llm1_model, "Left Hemisphere", self.llm1_terminal, can_execute_code=True)
+        self.llm2 = LLM(llm2_model, "Right Hemisphere", self.llm2_terminal, can_execute_code=False)
+    
+    def run(self):
+        """Run the brain simulation"""
+        print("Welcome to the Hemispherical Brain Simulation!")
+        print("Type 'exit' to quit the simulation.")
+        
+        # Check if Ollama is running
+        try:
+            response = requests.get("http://localhost:11434/api/version")
+            if response.status_code != 200:
+                print("Error: Could not connect to Ollama server. Make sure it's running on http://localhost:11434")
+                return
+        except requests.exceptions.RequestException:
+            print("Error: Could not connect to Ollama server. Make sure it's running on http://localhost:11434")
+            return
+        
+        # Check if the models are available
+        try:
+            models_response = requests.get("http://localhost:11434/api/tags")
+            if models_response.status_code != 200:
+                print("Error: Could not get the list of available models from Ollama.")
+                return
+            
+            available_models = [model["name"] for model in models_response.json().get("models", [])]
+            
+            if self.llm1.model_name not in available_models:
+                print(f"Error: Model '{self.llm1.model_name}' is not available. Please download it using 'ollama pull {self.llm1.model_name}'")
+                return
+                
+            if self.llm2.model_name not in available_models:
+                print(f"Error: Model '{self.llm2.model_name}' is not available. Please download it using 'ollama pull {self.llm2.model_name}'")
+                return
+        except requests.exceptions.RequestException as e:
+            print(f"Error checking available models: {str(e)}")
+            return
+        except json.JSONDecodeError:
+            print("Error parsing the response from Ollama. The server might be running but returned an invalid response.")
+            return
+        
+        print(f"Using models: {self.llm1.model_name} (Left Hemisphere) and {self.llm2.model_name} (Right Hemisphere)")
+        
+        while True:
+            try:
+                # Get the user's query
+                user_query = input("\nYou: ")
+                
+                if user_query.lower() == 'exit':
+                    print("Exiting the simulation. Goodbye!")
+                    break
+                
+                # Run a conversation between the LLMs
+                self.run_conversation(user_query)
+            except KeyboardInterrupt:
+                print("\nKeyboard interrupt detected. Exiting the simulation. Goodbye!")
+                break
+            except Exception as e:
+                print(f"\nAn error occurred: {str(e)}")
+                print("The simulation will continue with the next query.")
+    
+    def run_conversation(self, user_query):
+        """Run a conversation between the LLMs based on the user's query"""
+        # Construct the prompt for llm1
+        llm1_prompt = f"""
+        You are simulating the left hemisphere of a brain in a hemispherical brain model. 
+        
+        Left hemisphere characteristics:
+        - Analytical and logical thinking
+        - Sequential and linear processing
+        - Detail-oriented
+        - Language processing
+        - Mathematical reasoning
+        
+        A user has asked: "{user_query}"
+        
+        Think about this query from your left-hemisphere perspective and discuss it with the right hemisphere (llm2).
+        You have the ability to execute Python code to help solve problems or demonstrate concepts.
+        
+        To execute code, format it as:
+        ```python
+        # Your code here
+        ```
+        
+        Be concise but thorough in your analysis. Focus on facts, logic, and detailed analysis.
+        """
+        
+        # Clear the terminals
+        self.llm1_terminal.clear()
+        self.llm2_terminal.clear()
+        
+        print("\nLeft Hemisphere (llm1):", end="\n", flush=True)
+        
+        # Get llm1's response
+        llm1_response = self.llm1.get_response_stream(llm1_prompt, self.llm1_terminal.write)
+        
+        # Extract and execute code blocks
+        code_blocks = self.llm1.extract_code_blocks(llm1_response)
+        execution_results = []
+        
+        for i, code_block in enumerate(code_blocks):
+            print(f"\nExecuting code block {i+1}:")
+            print("```python")
+            print(code_block)
+            print("```")
+            
+            result = self.llm1.execute_code(code_block, lambda text: sys.stdout.write(text) or sys.stdout.flush())
+            execution_results.append(result)
+        
+        # Construct a summary of the code execution results
+        execution_summary = ""
+        for i, result in enumerate(execution_results):
+            execution_summary += f"\nCode Block {i+1} Execution Result:\n"
+            execution_summary += f"Status: {result['status']}\n"
+            
+            if result['stdout']:
+                execution_summary += f"Output:\n{result['stdout']}\n"
+            
+            if result['stderr']:
+                execution_summary += f"Errors:\n{result['stderr']}\n"
+        
+        # Construct the prompt for llm2
+        llm2_prompt = f"""
+        You are simulating the right hemisphere of a brain in a hemispherical brain model.
+        
+        Right hemisphere characteristics:
+        - Intuitive and holistic thinking
+        - Parallel processing
+        - Big-picture perspective
+        - Visual and spatial awareness
+        - Emotional processing
+        - Creative thinking
+        
+        A user has asked: "{user_query}"
+        
+        The left hemisphere (llm1) has responded:
+        "{llm1_response}"
+        
+        {execution_summary if execution_results else ""}
+        
+        What are your thoughts on this question from your right-hemisphere perspective? Consider the emotional, intuitive, and creative aspects that the left hemisphere might have missed. You can provide alternative perspectives or expand on the ideas.
+        
+        Be concise but insightful in your response. Focus on creativity, intuition, emotion, and holistic understanding.
+        """
+        
+        print("\nRight Hemisphere (llm2):", end="\n", flush=True)
+        
+        # Get llm2's response
+        llm2_response = self.llm2.get_response_stream(llm2_prompt, self.llm2_terminal.write)
+        
+        # Now let llm1 respond to llm2
+        llm1_followup_prompt = f"""
+        The right hemisphere (llm2) has responded to the user's query:
+        "{llm2_response}"
+        
+        What are your final thoughts after considering their perspective? Try to integrate their insights with your analytical approach to provide a complete understanding of the topic.
+        
+        Remember to stay true to your left-hemisphere characteristics (analytical, logical, sequential, detail-oriented), but acknowledge the value of the right-hemisphere's contribution.
+        
+        Be concise and focus on the most important insights.
+        """
+        
+        print("\nLeft Hemisphere (llm1) Final Thoughts:", end="\n", flush=True)
+        
+        # Get llm1's final response
+        llm1_final_response = self.llm1.get_response_stream(llm1_followup_prompt, self.llm1_terminal.write)
+        
+        # Extract and execute any additional code blocks from the final response
+        code_blocks = self.llm1.extract_code_blocks(llm1_final_response)
+        
+        for i, code_block in enumerate(code_blocks):
+            print(f"\nExecuting additional code block {i+1}:")
+            print("```python")
+            print(code_block)
+            print("```")
+            
+            self.llm1.execute_code(code_block, lambda text: sys.stdout.write(text) or sys.stdout.flush())
+
+def main():
+    """Parse command line arguments and run the brain simulation"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Hemispherical Brain Simulation using two LLMs')
+    parser.add_argument('--llm1', default='llama2', help='Model name for the left hemisphere (default: llama2)')
+    parser.add_argument('--llm2', default='mistral', help='Model name for the right hemisphere (default: mistral)')
+    
+    args = parser.parse_args()
+    
+    # Create and run the simulation
+    simulation = BrainSimulation(llm1_model=args.llm1, llm2_model=args.llm2)
+    simulation.run()
+
+if __name__ == "__main__":
+    main()
