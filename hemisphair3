@@ -40,10 +40,16 @@ class LLM:
     def get_response_stream(self, prompt, callback=None):
         """Get a response from the LLM and stream it in real-time"""
         url = "http://localhost:11434/api/generate"
+        
+        # Add more details to the request to help Ollama identify the model
         data = {
             "model": self.model_name,
             "prompt": prompt,
-            "stream": True
+            "stream": True,
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9
+            }
         }
         
         try:
@@ -271,26 +277,77 @@ class BrainSimulation:
         
         # Check if the models are available
         try:
+            # The correct API endpoint for listing models
             models_response = requests.get("http://localhost:11434/api/tags")
             if models_response.status_code != 200:
                 print("Error: Could not get the list of available models from Ollama.")
                 return
             
-            available_models = [model["name"] for model in models_response.json().get("models", [])]
+            # Debug: Print raw response to understand the structure
+            models_data = models_response.json()
+            print("Available models in Ollama:")
             
-            if self.llm1.model_name not in available_models:
-                print(f"Error: Model '{self.llm1.model_name}' is not available. Please download it using 'ollama pull {self.llm1.model_name}'")
+            # The response format seems to have changed in newer Ollama versions
+            if "models" in models_data:
+                # Older format
+                available_models = [model["name"] for model in models_data.get("models", [])]
+                for model in available_models:
+                    print(f"  - {model}")
+            else:
+                # Newer format - direct list of models
+                available_models = []
+                for model_info in models_data.get("models", []):
+                    model_name = model_info.get("name", "")
+                    if model_name:
+                        available_models.append(model_name)
+                        print(f"  - {model_name}")
+            
+            # If no models were found, try a different approach - list them directly
+            if not available_models:
+                print("No models found with the first method. Trying alternative approach...")
+                list_response = requests.post("http://localhost:11434/api/list")
+                if list_response.status_code == 200:
+                    models_list = list_response.json().get("models", [])
+                    available_models = [model.get("name", "") for model in models_list]
+                    print("Models found with alternative method:")
+                    for model in available_models:
+                        print(f"  - {model}")
+            
+            # If still no models, skip the check
+            if not available_models:
+                print("Warning: Could not determine available models. Proceeding anyway...")
                 return
+            
+            # Check if specified models are available, with more permissive matching
+            model1_available = any(self.llm1.model_name.lower() in model.lower() for model in available_models)
+            model2_available = any(self.llm2.model_name.lower() in model.lower() for model in available_models)
+            
+            if not model1_available:
+                print(f"Warning: Model matching '{self.llm1.model_name}' was not found in available models.")
+                print(f"Would you like to continue anyway? (y/n)")
+                response = input().lower()
+                if response != 'y':
+                    return
                 
-            if self.llm2.model_name not in available_models:
-                print(f"Error: Model '{self.llm2.model_name}' is not available. Please download it using 'ollama pull {self.llm2.model_name}'")
-                return
+            if not model2_available:
+                print(f"Warning: Model matching '{self.llm2.model_name}' was not found in available models.")
+                print(f"Would you like to continue anyway? (y/n)")
+                response = input().lower()
+                if response != 'y':
+                    return
+                
         except requests.exceptions.RequestException as e:
             print(f"Error checking available models: {str(e)}")
-            return
-        except json.JSONDecodeError:
-            print("Error parsing the response from Ollama. The server might be running but returned an invalid response.")
-            return
+            print("Would you like to continue anyway? (y/n)")
+            response = input().lower()
+            if response != 'y':
+                return
+        except json.JSONDecodeError as e:
+            print(f"Error parsing the response from Ollama: {str(e)}")
+            print("Would you like to continue anyway? (y/n)")
+            response = input().lower()
+            if response != 'y':
+                return
         
         print(f"Using models: {self.llm1.model_name} (Left Hemisphere) and {self.llm2.model_name} (Right Hemisphere)")
         
@@ -436,11 +493,77 @@ def main():
     parser = argparse.ArgumentParser(description='Hemispherical Brain Simulation using two LLMs')
     parser.add_argument('--llm1', default='llama2', help='Model name for the left hemisphere (default: llama2)')
     parser.add_argument('--llm2', default='mistral', help='Model name for the right hemisphere (default: mistral)')
+    parser.add_argument('--force', action='store_true', help='Force run without checking model availability')
+    parser.add_argument('--list-models', action='store_true', help='List available models and exit')
     
     args = parser.parse_args()
     
+    # If just listing models
+    if args.list_models:
+        try:
+            # Try both API endpoints
+            print("Checking available models in Ollama...")
+            
+            # First method
+            response = requests.get("http://localhost:11434/api/tags")
+            if response.status_code == 200:
+                models_data = response.json()
+                print("\nModels (via /api/tags):")
+                if "models" in models_data:
+                    for model in models_data.get("models", []):
+                        print(f"  - {model.get('name', 'Unknown')}")
+                else:
+                    print("  No models found with this endpoint.")
+            
+            # Second method
+            response = requests.post("http://localhost:11434/api/list")
+            if response.status_code == 200:
+                models_list = response.json().get("models", [])
+                print("\nModels (via /api/list):")
+                for model in models_list:
+                    print(f"  - {model.get('name', 'Unknown')}")
+                    
+            print("\nUse these model names with the --llm1 and --llm2 arguments.")
+            return
+        except Exception as e:
+            print(f"Error listing models: {str(e)}")
+            return
+    
     # Create and run the simulation
     simulation = BrainSimulation(llm1_model=args.llm1, llm2_model=args.llm2)
+    
+    # Modify the run method to bypass model checking if --force is used
+    if args.force:
+        # We'll create a custom run method that skips model checking
+        original_run = simulation.run
+        
+        def force_run():
+            print("Forcing run without model availability check...")
+            # Skip directly to the conversation loop
+            print(f"Using models: {simulation.llm1.model_name} (Left Hemisphere) and {simulation.llm2.model_name} (Right Hemisphere)")
+            
+            while True:
+                try:
+                    # Get the user's query
+                    user_query = input("\nYou: ")
+                    
+                    if user_query.lower() == 'exit':
+                        print("Exiting the simulation. Goodbye!")
+                        break
+                    
+                    # Run a conversation between the LLMs
+                    simulation.run_conversation(user_query)
+                except KeyboardInterrupt:
+                    print("\nKeyboard interrupt detected. Exiting the simulation. Goodbye!")
+                    break
+                except Exception as e:
+                    print(f"\nAn error occurred: {str(e)}")
+                    print("The simulation will continue with the next query.")
+        
+        # Replace the run method with our custom version
+        simulation.run = force_run
+    
+    # Run the simulation
     simulation.run()
 
 if __name__ == "__main__":
